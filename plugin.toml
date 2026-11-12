@@ -1,7 +1,7 @@
 [plugin]
 id = "matt.firealarm"
 name = "Fire Alarm"
-version = "0.1.1"
+version = "0.2.0"
 description = "Fire alarm design: NFPA 170 devices, addressing, device counts, battery and voltage drop calcs."
 author = "Matt"
 license = "GPL-3.0-only"
