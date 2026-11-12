@@ -8,7 +8,13 @@ AlarmCAD-style fire alarm design tools as an Open CAD Studio plugin.
   standby/alarm current (XDATA app `FIREALARM`, round-trips through DWG/DXF)
 - **Device count** and **CSV export**
 - **Battery calculation** (NFPA 72 standby/alarm durations, safety margin)
-- **NAC voltage drop** per circuit (worst case, load lumped at end of line)
+- **NAC voltage drop** per circuit (worst case, load lumped at end of line),
+  using the length of the wire you drew or a length you type
+- **Coverage**: smoke/heat detector circles (0.7 x listed spacing) and strobe
+  room squares from the NFPA 72 single-appliance room tables, on layer FA-COVERAGE
+- **Wire Circuit**: click devices in order to draw an SLC/NAC run on FA-WIRING;
+  horns/strobes you wire take that NAC's name
+- **Riser diagram**: panel plus one row per circuit with device symbols and counts
 
 Current draws are typical values for a generic 24 VDC system. Verify them
 against the datasheets for the devices you actually install.
@@ -29,3 +35,11 @@ release. Restart the app; a **Fire Alarm** tab appears.
 | `FA_EXPORT <path>` | Export the device list to CSV |
 | `FA_BATTERY` | Battery calculation |
 | `FA_VDROP` | NAC voltage drop |
+| `FA_COVERAGE` | Draw (or redraw) detector and strobe coverage |
+| `FA_WIRE` | Draw a circuit by clicking devices in order |
+| `FA_RISER` | Draw a riser diagram at a picked point |
+
+Coverage values: wall strobe 15 cd = 20x20 ft, 30 cd = 28x28, 75 cd = 45x45,
+95 cd = 50x50, 110 cd = 54x54, 135 cd = 60x60, 185 cd = 70x70; ceiling strobe
+(10 ft ceiling) 15 cd = 20x20, 30 cd = 30x30, 75 cd = 40x40, 95 cd+ = 50x50.
+Check these against the NFPA 72 edition your AHJ enforces.
