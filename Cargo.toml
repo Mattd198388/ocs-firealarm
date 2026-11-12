@@ -1,0 +1,17 @@
+[package]
+name = "ocs-firealarm"
+version = "0.1.0"
+edition = "2021"
+description = "Fire alarm design tools for Open CAD Studio"
+license = "GPL-3.0-only"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ocs_plugin_api = { git = "https://github.com/HakanSeven12/OpenCADStudio", tag = "v2026.45", features = ["host"] }
+
+[profile.release]
+opt-level = 3
