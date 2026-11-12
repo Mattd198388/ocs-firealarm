@@ -1,0 +1,64 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            lib: ocs_firealarm.dll
+            asset: matt.firealarm-windows-x86_64.dll
+          - os: ubuntu-latest
+            lib: libocs_firealarm.so
+            asset: matt.firealarm-linux-x86_64.so
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --release --lib
+      - name: Build
+        run: cargo build --release
+      - name: Stage asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.lib }}" "dist/${{ matrix.asset }}"
+          cp plugin.toml dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read version
+        id: ver
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Fire Alarm v${{ steps.ver.outputs.version }}
+          make_latest: true
+          files: |
+            dist/*.dll
+            dist/*.so
+            dist/plugin.toml
