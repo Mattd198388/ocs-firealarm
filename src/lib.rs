@@ -7,7 +7,7 @@
 pub mod calc;
 pub mod catalog;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 use catalog::{Category, DeviceType, DEVICES};
@@ -351,6 +351,93 @@ fn start_place(host: &mut dyn HostApi, dev: &'static DeviceType) {
     host.start_interactive(Box::new(PlaceCmd { dev }));
 }
 
+
+// ───────────────────────────── dialogs ─────────────────────────────
+//
+// The host delivers a submitted dialog only to an active interactive command,
+// so each dialog runs inside a DialogCmd that forwards the values back to
+// `dispatch` as "FA_DLG|<kind>|key=value;key=value".
+
+fn enc(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'/' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+fn dec(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn value_text(v: &DialogValue) -> String {
+    match v {
+        DialogValue::Text(t) => t.clone(),
+        DialogValue::Number(n) => n.to_string(),
+        DialogValue::Bool(b) => b.to_string(),
+        DialogValue::Choice { text, .. } => text.clone(),
+        DialogValue::FilePath(p) => p.clone(),
+        _ => String::new(),
+    }
+}
+
+struct DialogCmd {
+    kind: &'static str,
+    def: Option<DialogDef>,
+}
+
+impl InteractiveCommand for DialogCmd {
+    fn prompt(&self) -> String {
+        "Fill in the dialog".into()
+    }
+    fn on_point(&mut self, _pt: [f64; 3]) -> CommandStep {
+        CommandStep::NeedPoint
+    }
+    fn on_enter(&mut self) -> CommandStep {
+        CommandStep::Done
+    }
+    fn modal_dialog(&self) -> Option<DialogDef> {
+        self.def.clone()
+    }
+    fn on_dialog_response(&mut self, response: DialogResponse) -> CommandStep {
+        self.def = None;
+        match response {
+            DialogResponse::Submitted(v) => {
+                let body: Vec<String> = v.iter().map(|(k, val)| format!("{}={}", enc(k), enc(&value_text(val)))).collect();
+                CommandStep::Dispatch(format!("FA_DLG|{}|{}", self.kind, body.join(";")))
+            }
+            DialogResponse::Cancelled => CommandStep::Cancel,
+        }
+    }
+}
+
+fn open_dialog(host: &mut dyn HostApi, kind: &'static str, def: DialogDef) {
+    host.start_interactive(Box::new(DialogCmd { kind, def: Some(def) }));
+}
+
+/// Parse "k=v;k=v" from FA_DLG into a value map.
+fn parse_dlg(body: &str) -> HashMap<String, DialogValue> {
+    body.split(';')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (dec(k).to_ascii_lowercase(), DialogValue::Text(dec(v))))
+        .collect()
+}
+
 // ───────────────────────────── settings dialog ─────────────────────────────
 
 fn num(v: Option<&DialogValue>) -> Option<f64> {
@@ -393,7 +480,11 @@ fn settings_dialog(host: &mut dyn HostApi) {
         ]))
         .with_row(DialogRow::single(DialogControl::Text { id: "nac".into(), label: "NAC circuit for new notification devices".into(), default: s.nac.clone() }))
         .submit_label("Save");
-    if let DialogResponse::Submitted(v) = host.show_dialog(dialog) {
+    open_dialog(host, "SETTINGS", dialog);
+}
+
+fn settings_apply(host: &mut dyn HostApi, v: &HashMap<String, DialogValue>) {
+    {
         let mut s = settings().lock().unwrap();
         if let Some(x) = num(v.get("scale")).filter(|x| *x > 0.0) { s.scale = x; }
         let new_loop = num(v.get("loop")).map(|x| x.round().max(1.0) as u32).unwrap_or(s.loop_no);
@@ -495,7 +586,13 @@ fn battery_calc(host: &mut dyn HostApi) {
             DialogControl::Number { id: "mgn".into(), label: "Safety margin %".into(), default: 20.0, min: Some(0.0), max: Some(100.0), step: Some(5.0) },
         ]))
         .submit_label("Calculate");
-    let DialogResponse::Submitted(v) = host.show_dialog(dialog) else { return };
+    open_dialog(host, "BATTERY", dialog);
+}
+
+fn battery_apply(host: &mut dyn HostApi, v: &HashMap<String, DialogValue>) {
+    let devs = collect_devices(host);
+    let dev_standby: f64 = devs.iter().map(|p| p.data.standby_ma).sum();
+    let dev_alarm: f64 = devs.iter().map(|p| p.data.alarm_ma.max(p.data.standby_ma)).sum();
     let input = calc::BatteryInput {
         standby_ma: dev_standby + num(v.get("psb")).unwrap_or(0.0),
         alarm_ma: dev_alarm + num(v.get("pal")).unwrap_or(0.0),
@@ -545,8 +642,26 @@ fn vdrop_calc(host: &mut dyn HostApi) {
             DialogControl::Number { id: "vmin".into(), label: "Min device volts".into(), default: 16.0, min: Some(1.0), max: Some(30.0), step: Some(0.1) },
         ]))
         .submit_label("Calculate");
-    let DialogResponse::Submitted(v) = host.show_dialog(dialog) else { return };
-    let ckt = text(v.get("ckt")).unwrap_or_else(|| names[0].clone());
+    open_dialog(host, "VDROP", dialog);
+}
+
+fn nac_circuits(host: &mut dyn HostApi) -> BTreeMap<String, (usize, f64)> {
+    let mut circuits: BTreeMap<String, (usize, f64)> = BTreeMap::new();
+    for p in &collect_devices(host) {
+        let is_nac = p.data.device_type().is_some_and(|d| d.category == Category::Notification);
+        if is_nac && !p.data.circuit.is_empty() {
+            let e = circuits.entry(p.data.circuit.clone()).or_default();
+            e.0 += 1;
+            e.1 += p.data.alarm_ma;
+        }
+    }
+    circuits
+}
+
+fn vdrop_apply(host: &mut dyn HostApi, v: &HashMap<String, DialogValue>) {
+    let circuits = nac_circuits(host);
+    let Some(first) = circuits.keys().next().cloned() else { return };
+    let ckt = text(v.get("ckt")).filter(|c| circuits.contains_key(c)).unwrap_or(first);
     let Some((n, ma)) = circuits.get(&ckt).copied() else { return };
     let input = calc::VdropInput {
         amps: ma / 1000.0,
@@ -665,6 +780,19 @@ impl BuiltinPlugin for FireAlarmPlugin {
             host.push_error("Fire Alarm: bad placement data");
             return true;
         }
+        if upper.starts_with("FA_DLG|") {
+            let mut parts = trimmed.splitn(3, '|');
+            let _ = parts.next();
+            let kind = parts.next().unwrap_or("").to_ascii_uppercase();
+            let v = parse_dlg(parts.next().unwrap_or(""));
+            match kind.as_str() {
+                "SETTINGS" => settings_apply(host, &v),
+                "BATTERY" => battery_apply(host, &v),
+                "VDROP" => vdrop_apply(host, &v),
+                _ => {}
+            }
+            return true;
+        }
         if upper.starts_with("FA_EXPORT ") {
             let path = trimmed["FA_EXPORT ".len()..].trim().trim_matches('"');
             export_csv(host, path);
@@ -698,3 +826,18 @@ impl BuiltinPlugin for FireAlarmPlugin {
 }
 
 export_plugin!(FireAlarmPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dialog_encoding_roundtrip() {
+        for s in ["NAC-1", "1/4", "a b;c=d|e%", "Ünïcode 15"] {
+            assert_eq!(dec(&enc(s)), s);
+        }
+        let v = parse_dlg(&format!("{}={};{}={}", enc("nac"), enc("nac 2"), enc("cd"), enc("75")));
+        assert_eq!(text(v.get("nac")).as_deref(), Some("nac 2"));
+        assert_eq!(num(v.get("cd")), Some(75.0));
+    }
+}
