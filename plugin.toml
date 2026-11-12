@@ -1,0 +1,13 @@
+[plugin]
+id = "matt.firealarm"
+name = "Fire Alarm"
+version = "0.1.0"
+description = "Fire alarm design: NFPA 170 devices, addressing, device counts, battery and voltage drop calcs."
+author = "Matt"
+license = "GPL-3.0-only"
+
+[opencad]
+api_version = 16
+ribbon_order = 40
+command_prefixes = ["FA_"]
+xdata_apps = ["FIREALARM"]
