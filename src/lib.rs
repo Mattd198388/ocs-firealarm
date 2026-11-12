@@ -6,6 +6,7 @@
 
 pub mod calc;
 pub mod catalog;
+pub mod coverage;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
@@ -13,11 +14,11 @@ use std::sync::{Mutex, OnceLock};
 use catalog::{Category, DeviceType, DEVICES};
 use ocs_plugin_api::dialog::{DialogControl, DialogDef, DialogResponse, DialogRow, DialogValue};
 use ocs_plugin_api::export_plugin;
-use ocs_plugin_api::host::acadrust::entities::{AttributeEntity, Insert};
-use ocs_plugin_api::host::acadrust::types::{Color, Vector3};
+use ocs_plugin_api::host::acadrust::entities::{AttributeEntity, Circle, Insert, Line, LwPolyline, Text};
+use ocs_plugin_api::host::acadrust::types::{Color, Vector2, Vector3};
 use ocs_plugin_api::host::{
     BuiltinPlugin, CommandRequest, CommandStep, EntityType, ExtendedDataRecord, Handle, HostApi,
-    InteractiveCommand, LayerConfig, XDataValue,
+    InteractiveCommand, LayerConfig, PreviewWire, XDataValue,
 };
 use ocs_plugin_api::manifest::{ApiVersion, EntityClasses, PluginManifest};
 use ocs_plugin_api::ribbon::{CadModule, IconKind, ModuleEvent, RibbonGroup, RibbonItem, ToolDef};
@@ -27,6 +28,11 @@ const APP: &str = "FIREALARM";
 const CLASS_PREFIX: &str = "FA-DEVICE:";
 const DEVICE_LAYER: &str = "FA-DEVICES";
 const LIBRARY_FILE: &str = "fa_blocks.dxf";
+const WIRING_LAYER: &str = "FA-WIRING";
+const COVERAGE_LAYER: &str = "FA-COVERAGE";
+const RISER_LAYER: &str = "FA-RISER";
+const WIRE_PREFIX: &str = "FA-WIRE:";
+const COVERAGE_TAG: &str = "FA-COVERAGE";
 
 static MANIFEST: PluginManifest = PluginManifest {
     id: PLUGIN_ID,
@@ -49,11 +55,18 @@ struct Settings {
     candela: u32,
     watts: String,
     nac: String,
+    /// Drawing units per foot: 12 for inch drawings, 1 for foot drawings.
+    units_per_ft: f64,
+    smoke_spacing_ft: f64,
+    heat_spacing_ft: f64,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { scale: 1.0, loop_no: 1, next_addr: None, candela: 15, watts: "1/4".into(), nac: "NAC-1".into() }
+        Self {
+            scale: 1.0, loop_no: 1, next_addr: None, candela: 15, watts: "1/4".into(), nac: "NAC-1".into(),
+            units_per_ft: 12.0, smoke_spacing_ft: 30.0, heat_spacing_ft: 50.0,
+        }
     }
 }
 
@@ -185,8 +198,10 @@ fn blocks_loaded(host: &dyn HostApi) -> bool {
 fn ensure_layers(host: &mut dyn HostApi) {
     for (name, color, desc) in [
         (DEVICE_LAYER, 1i16, "Fire alarm devices"),
-        ("FA-WIRING", 3, "Fire alarm wiring"),
+        (WIRING_LAYER, 3, "Fire alarm wiring"),
         ("FA-TEXT", 7, "Fire alarm notes and tags"),
+        (COVERAGE_LAYER, 4, "Detector and strobe coverage (turn off to hide)"),
+        (RISER_LAYER, 7, "Fire alarm riser diagram"),
     ] {
         let exists = host.document().layers.get(name).is_some();
         if !exists {
@@ -459,48 +474,49 @@ fn settings_dialog(host: &mut dyn HostApi) {
     let s = settings().lock().unwrap().clone();
     let next = s.next_addr.unwrap_or_else(|| next_address(host, s.loop_no));
     let cd_idx = catalog::CANDELAS.iter().position(|c| *c == s.candela).unwrap_or(0);
+    let units_idx = if s.units_per_ft == 1.0 { 1 } else { 0 };
+    // Two rows only: the host's dialog window does not grow to fit more.
     let dialog = DialogDef::new("Fire Alarm Settings")
-        .with_row(DialogRow::single(DialogControl::InfoText {
-            text: "Symbols are drawn 12 in. across at scale 1. Use a bigger scale for larger symbols.".into(),
-            align_h: None,
-        }))
-        .with_row(DialogRow::single(DialogControl::Number {
-            id: "scale".into(), label: "Symbol scale".into(), default: s.scale, min: Some(0.01), max: Some(1000.0), step: Some(0.25),
-        }))
         .with_row(DialogRow::new(vec![
+            DialogControl::Number { id: "scale".into(), label: "Symbol scale".into(), default: s.scale, min: Some(0.01), max: Some(1000.0), step: Some(0.25) },
+            DialogControl::Choice { id: "units".into(), label: "Drawing units".into(), options: vec!["Inches".into(), "Feet".into()], default_index: units_idx },
             DialogControl::Number { id: "loop".into(), label: "SLC loop".into(), default: s.loop_no as f64, min: Some(1.0), max: Some(99.0), step: Some(1.0) },
             DialogControl::Number { id: "next".into(), label: "Next address".into(), default: next as f64, min: Some(1.0), max: Some(999.0), step: Some(1.0) },
-        ]))
-        .with_row(DialogRow::new(vec![
             DialogControl::Choice {
-                id: "cd".into(), label: "Strobe candela".into(),
+                id: "cd".into(), label: "Candela".into(),
                 options: catalog::CANDELAS.iter().map(|c| format!("{c}")).collect(), default_index: cd_idx,
             },
-            DialogControl::Text { id: "watts".into(), label: "Speaker tap (W)".into(), default: s.watts.clone() },
         ]))
-        .with_row(DialogRow::single(DialogControl::Text { id: "nac".into(), label: "NAC circuit for new notification devices".into(), default: s.nac.clone() }))
-        .submit_label("Save");
+        .with_row(DialogRow::new(vec![
+            DialogControl::Text { id: "nac".into(), label: "NAC circuit".into(), default: s.nac.clone() },
+            DialogControl::Text { id: "watts".into(), label: "Speaker tap (W)".into(), default: s.watts.clone() },
+            DialogControl::Number { id: "smoke".into(), label: "Smoke spacing (ft)".into(), default: s.smoke_spacing_ft, min: Some(1.0), max: Some(100.0), step: Some(1.0) },
+            DialogControl::Number { id: "heat".into(), label: "Heat spacing (ft)".into(), default: s.heat_spacing_ft, min: Some(1.0), max: Some(100.0), step: Some(1.0) },
+        ]))
+        .submit_label("Save")
+        .width(900.0);
     open_dialog(host, "SETTINGS", dialog);
 }
 
 fn settings_apply(host: &mut dyn HostApi, v: &HashMap<String, DialogValue>) {
-    {
+    let msg = {
         let mut s = settings().lock().unwrap();
         if let Some(x) = num(v.get("scale")).filter(|x| *x > 0.0) { s.scale = x; }
-        let new_loop = num(v.get("loop")).map(|x| x.round().max(1.0) as u32).unwrap_or(s.loop_no);
-        let new_next = num(v.get("next")).map(|x| x.round().max(1.0) as u32);
-        s.loop_no = new_loop;
-        s.next_addr = new_next;
+        if let Some(u) = text(v.get("units")) { s.units_per_ft = if u.eq_ignore_ascii_case("feet") { 1.0 } else { 12.0 }; }
+        s.loop_no = num(v.get("loop")).map(|x| x.round().max(1.0) as u32).unwrap_or(s.loop_no);
+        s.next_addr = num(v.get("next")).map(|x| x.round().max(1.0) as u32);
         if let Some(t) = text(v.get("cd")).and_then(|t| t.parse().ok()) { s.candela = t; }
         if let Some(t) = text(v.get("watts")).filter(|t| !t.is_empty()) { s.watts = t; }
         if let Some(t) = text(v.get("nac")).filter(|t| !t.is_empty()) { s.nac = t.to_uppercase(); }
-        let msg = format!(
-            "Fire Alarm settings: scale {}, loop {}, next address {}, {} cd, {} W, {}",
-            s.scale, s.loop_no, s.next_addr.unwrap_or(1), s.candela, s.watts, s.nac
-        );
-        drop(s);
-        host.push_info(&msg);
-    }
+        if let Some(x) = num(v.get("smoke")).filter(|x| *x > 0.0) { s.smoke_spacing_ft = x; }
+        if let Some(x) = num(v.get("heat")).filter(|x| *x > 0.0) { s.heat_spacing_ft = x; }
+        format!(
+            "Fire Alarm settings: scale {}, {} drawing, loop {}, next address {}, {} cd, {} W, {}, smoke {} ft, heat {} ft",
+            s.scale, if s.units_per_ft == 1.0 { "feet" } else { "inch" }, s.loop_no, s.next_addr.unwrap_or(1),
+            s.candela, s.watts, s.nac, s.smoke_spacing_ft, s.heat_spacing_ft
+        )
+    };
+    host.push_info(&msg);
 }
 
 // ───────────────────────────── reports ─────────────────────────────
@@ -629,12 +645,22 @@ fn vdrop_calc(host: &mut dyn HostApi) {
     let names: Vec<String> = circuits.keys().cloned().collect();
     let dialog = DialogDef::new("NAC Voltage Drop")
         .with_row(DialogRow::single(DialogControl::InfoText {
-            text: circuits.iter().map(|(k, (n, ma))| format!("{k}: {n} devices, {:.2} A", ma / 1000.0)).collect::<Vec<_>>().join("   "),
+            text: {
+                let wires = wire_lengths_ft(host);
+                circuits
+                    .iter()
+                    .map(|(k, (n, ma))| match wires.get(k) {
+                        Some(ft) => format!("{k}: {n} devices, {:.2} A, {:.0} ft drawn", ma / 1000.0, ft),
+                        None => format!("{k}: {n} devices, {:.2} A, no wire drawn", ma / 1000.0),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("   ")
+            },
             align_h: None,
         }))
         .with_row(DialogRow::new(vec![
             DialogControl::Choice { id: "ckt".into(), label: "Circuit".into(), options: names.clone(), default_index: 0 },
-            DialogControl::Number { id: "len".into(), label: "One-way length (ft)".into(), default: 200.0, min: Some(1.0), max: None, step: Some(10.0) },
+            DialogControl::Number { id: "len".into(), label: "One-way length ft (0 = drawn wire)".into(), default: 0.0, min: Some(0.0), max: None, step: Some(10.0) },
             DialogControl::Choice { id: "awg".into(), label: "Wire".into(), options: vec!["18".into(), "16".into(), "14".into(), "12".into(), "10".into()], default_index: 2 },
         ]))
         .with_row(DialogRow::new(vec![
@@ -665,7 +691,16 @@ fn vdrop_apply(host: &mut dyn HostApi, v: &HashMap<String, DialogValue>) {
     let Some((n, ma)) = circuits.get(&ckt).copied() else { return };
     let input = calc::VdropInput {
         amps: ma / 1000.0,
-        length_ft: num(v.get("len")).unwrap_or(200.0),
+        length_ft: match num(v.get("len")).filter(|l| *l > 0.0) {
+            Some(l) => l,
+            None => match wire_lengths_ft(host).get(&ckt).copied() {
+                Some(l) => l,
+                None => {
+                    host.push_error(&format!("Fire Alarm: no wire drawn for {ckt}. Draw it with Wire Circuit or type a length."));
+                    return;
+                }
+            },
+        },
         awg: text(v.get("awg")).and_then(|t| t.parse().ok()).unwrap_or(14),
         source_volts: num(v.get("src")).unwrap_or(20.4),
         min_volts: num(v.get("vmin")).unwrap_or(16.0),
@@ -680,6 +715,386 @@ fn vdrop_apply(host: &mut dyn HostApi, v: &HashMap<String, DialogValue>) {
     } else {
         host.push_error(&format!("FAIL: {ckt} is below {:.1} V at the last device. Use heavier wire, shorten the run, or split the circuit.", input.min_volts));
     }
+}
+
+
+// ───────────────────────────── geometry helpers ─────────────────────────────
+
+/// Insertion point and rotation (radians) of every placed device.
+fn device_positions(host: &mut dyn HostApi, devs: &[Placed]) -> Vec<Option<(f64, f64, f64)>> {
+    let handles: Vec<Handle> = devs.iter().map(|p| p.handle).collect();
+    host.entities_batch(&handles)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| match e {
+            Some(EntityType::Insert(i)) => Some((i.insert_point.x, i.insert_point.y, i.rotation)),
+            _ => None,
+        })
+        .chain(std::iter::repeat(None))
+        .take(devs.len())
+        .collect()
+}
+
+fn on_layer<T>(mut e: T, layer: &str, set: impl FnOnce(&mut T, String)) -> T {
+    set(&mut e, layer.to_string());
+    e
+}
+
+fn poly(points: &[(f64, f64)], closed: bool, layer: &str) -> EntityType {
+    let mut p = LwPolyline::from_points(points.iter().map(|(x, y)| Vector2::new(*x, *y)).collect());
+    if closed {
+        p.close();
+    }
+    p.common.layer = layer.to_string();
+    EntityType::LwPolyline(p)
+}
+
+fn label(textv: &str, x: f64, y: f64, h: f64, layer: &str) -> EntityType {
+    let t = on_layer(Text::with_value(textv, Vector3::new(x, y, 0.0)).with_height(h), layer, |t, l| t.common.layer = l);
+    EntityType::Text(t)
+}
+
+fn tag_record(tag: &str) -> ExtendedDataRecord {
+    let mut r = ExtendedDataRecord::new(APP);
+    r.add_value(XDataValue::String(tag.to_string()));
+    r
+}
+
+/// Every entity carrying a FIREALARM record whose first string starts with `prefix`.
+fn tagged_entities(host: &mut dyn HostApi, layer: &str, prefix: &str) -> Vec<(Handle, String, EntityType)> {
+    let mut out = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let q = format!(r#"{{"layer":"{layer}","xdata_app":"{APP}","offset":{offset},"limit":2000}}"#);
+        let Ok(page) = host.query_entities(&q) else { break };
+        for e in page.entities {
+            let h = e.common().handle;
+            let tag = host.read_record(h, APP).and_then(|r| {
+                r.values.iter().find_map(|v| match v {
+                    XDataValue::String(s) if s.starts_with(prefix) => Some(s.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(tag) = tag {
+                out.push((h, tag, e));
+            }
+        }
+        match page.next_offset {
+            Some(n) if n > offset => offset = n,
+            _ => break,
+        }
+    }
+    out
+}
+
+fn polyline_length(e: &EntityType) -> f64 {
+    match e {
+        EntityType::LwPolyline(p) => p
+            .vertices
+            .windows(2)
+            .map(|w| ((w[1].location.x - w[0].location.x).powi(2) + (w[1].location.y - w[0].location.y).powi(2)).sqrt())
+            .sum(),
+        _ => 0.0,
+    }
+}
+
+/// Drawn wire length per circuit, in feet.
+fn wire_lengths_ft(host: &mut dyn HostApi) -> BTreeMap<String, f64> {
+    let upf = settings().lock().unwrap().units_per_ft;
+    let mut out = BTreeMap::new();
+    for (_, tag, e) in tagged_entities(host, WIRING_LAYER, WIRE_PREFIX) {
+        let ckt = tag.trim_start_matches(WIRE_PREFIX).to_string();
+        *out.entry(ckt).or_insert(0.0) += polyline_length(&e) / upf;
+    }
+    out
+}
+
+// ───────────────────────────── coverage ─────────────────────────────
+
+fn coverage(host: &mut dyn HostApi) {
+    if !ensure_setup(host) {
+        return;
+    }
+    let s = settings().lock().unwrap().clone();
+    let upf = s.units_per_ft;
+    let old = tagged_entities(host, COVERAGE_LAYER, COVERAGE_TAG);
+    host.begin_undo_group("Fire alarm coverage");
+    host.push_undo("Fire alarm coverage");
+    for (h, _, _) in &old {
+        host.remove_entity(*h);
+    }
+    let devs = collect_devices(host);
+    let pos = device_positions(host, &devs);
+    let mut ents: Vec<EntityType> = Vec::new();
+    let (mut n_det, mut n_strobe, mut missing) = (0, 0, Vec::new());
+    for (p, at) in devs.iter().zip(pos) {
+        let Some((x, y, rot)) = at else { continue };
+        let key = p.data.key.as_str();
+        let text_h = 4.0 * s.scale * upf / 12.0;
+        match key {
+            "SMOKE" | "HEAT" => {
+                let spacing = if key == "SMOKE" { s.smoke_spacing_ft } else { s.heat_spacing_ft };
+                let r = coverage::detector_radius_ft(spacing) * upf;
+                let mut c = Circle::from_center_radius(Vector3::new(x, y, 0.0), r);
+                c.common.layer = COVERAGE_LAYER.to_string();
+                ents.push(EntityType::Circle(c));
+                n_det += 1;
+            }
+            "HS-WALL" | "S-WALL" | "SS-WALL" | "HS-CLG" | "S-CLG" | "SS-CLG" => {
+                let ceiling = key.ends_with("CLG");
+                let room = if ceiling { coverage::ceiling_strobe_room_ft(p.data.candela) } else { coverage::wall_strobe_room_ft(p.data.candela) };
+                let Some(side) = room else {
+                    missing.push(format!("{} {} cd", p.data.device_type().map(|d| d.label).unwrap_or(key), p.data.candela));
+                    continue;
+                };
+                let l = side * upf;
+                // Wall strobe sits at the middle of one wall; the room extends
+                // toward the symbol's bottom (local -Y). Ceiling strobe is centered.
+                let local: [(f64, f64); 4] = if ceiling {
+                    [(-l / 2.0, -l / 2.0), (l / 2.0, -l / 2.0), (l / 2.0, l / 2.0), (-l / 2.0, l / 2.0)]
+                } else {
+                    [(-l / 2.0, 0.0), (l / 2.0, 0.0), (l / 2.0, -l), (-l / 2.0, -l)]
+                };
+                let (sn, cs) = rot.sin_cos();
+                let pts: Vec<(f64, f64)> = local.iter().map(|(lx, ly)| (x + lx * cs - ly * sn, y + lx * sn + ly * cs)).collect();
+                ents.push(poly(&pts, true, COVERAGE_LAYER));
+                let (cx, cy) = if ceiling { (x, y) } else { (x + (l / 2.0) * sn, y - (l / 2.0) * cs) };
+                ents.push(label(&format!("{} cd {:.0}'x{:.0}'", p.data.candela, side, side), cx - 3.0 * text_h, cy, text_h, COVERAGE_LAYER));
+                n_strobe += 1;
+            }
+            _ => {}
+        }
+    }
+    let handles = host.add_entities(ents);
+    for h in handles {
+        host.write_record(h, tag_record(COVERAGE_TAG));
+    }
+    host.end_undo_group();
+    host.set_dirty();
+    host.push_output("── Coverage ──");
+    host.push_output(&format!(
+        "{n_det} detector circles (smoke {:.0} ft spacing = {:.0} ft radius, heat {:.0} ft = {:.0} ft radius)",
+        s.smoke_spacing_ft, coverage::detector_radius_ft(s.smoke_spacing_ft), s.heat_spacing_ft, coverage::detector_radius_ft(s.heat_spacing_ft)
+    ));
+    host.push_output(&format!("{n_strobe} strobe rooms (wall: room extends below the symbol; ceiling: centered, 10 ft ceiling)"));
+    for m in missing {
+        host.push_error(&format!("No prescriptive room size for {m}"));
+    }
+    host.push_output("Coverage is on layer FA-COVERAGE. Run Coverage again after moving devices. Verify against your NFPA 72 edition.");
+}
+
+// ───────────────────────────── wiring ─────────────────────────────
+
+struct WireCmd {
+    /// (handle value, x, y, circuit) of every device that can be picked.
+    devices: Vec<(u64, f64, f64, String)>,
+    snap: f64,
+    points: Vec<(f64, f64)>,
+    picked: Vec<u64>,
+    circuit: Option<String>,
+}
+
+impl WireCmd {
+    fn nearest(&self, x: f64, y: f64) -> Option<&(u64, f64, f64, String)> {
+        self.devices
+            .iter()
+            .map(|d| (d, (d.1 - x).hypot(d.2 - y)))
+            .filter(|(_, dist)| *dist <= self.snap)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(d, _)| d)
+    }
+}
+
+impl InteractiveCommand for WireCmd {
+    fn prompt(&self) -> String {
+        match &self.circuit {
+            None => "Wire circuit: click the first device (or the panel), Enter to finish".into(),
+            Some(c) => format!("Wire {c}: click the next device or a bend point, Enter to finish ({} devices)", self.picked.len()),
+        }
+    }
+    fn on_point(&mut self, pt: [f64; 3]) -> CommandStep {
+        let hit = self.nearest(pt[0], pt[1]).cloned();
+        match hit {
+            Some((h, x, y, ckt)) => {
+                if self.circuit.is_none() && !ckt.is_empty() {
+                    self.circuit = Some(ckt);
+                }
+                if !self.picked.contains(&h) {
+                    self.picked.push(h);
+                }
+                self.points.push((x, y));
+            }
+            None => self.points.push((pt[0], pt[1])),
+        }
+        CommandStep::NeedPoint
+    }
+    fn on_cursor_move(&mut self, pt: [f64; 3]) -> Vec<PreviewWire> {
+        let mut pts: Vec<[f64; 3]> = self.points.iter().map(|(x, y)| [*x, *y, 0.0]).collect();
+        if pts.is_empty() {
+            return Vec::new();
+        }
+        pts.push(pt);
+        vec![PreviewWire::Polyline { points: pts, color: Some([0.2, 0.9, 0.2, 1.0]) }]
+    }
+    fn on_enter(&mut self) -> CommandStep {
+        if self.points.len() < 2 {
+            return CommandStep::Done;
+        }
+        let ckt = self.circuit.clone().unwrap_or_else(|| settings().lock().unwrap().nac.clone());
+        let hs: Vec<String> = self.picked.iter().map(|h| format!("{h:X}")).collect();
+        let pts: Vec<String> = self.points.iter().map(|(x, y)| format!("{x},{y}")).collect();
+        CommandStep::Dispatch(format!("FA_WIREDONE|{}|{}|{}", enc(&ckt), hs.join(","), pts.join(";")))
+    }
+}
+
+fn start_wire(host: &mut dyn HostApi) {
+    if !ensure_setup(host) {
+        return;
+    }
+    let s = settings().lock().unwrap().clone();
+    let devs = collect_devices(host);
+    let pos = device_positions(host, &devs);
+    let devices = devs
+        .iter()
+        .zip(pos)
+        .filter_map(|(p, at)| at.map(|(x, y, _)| (p.handle.value(), x, y, p.data.circuit.clone())))
+        .collect();
+    host.start_interactive(Box::new(WireCmd {
+        devices,
+        snap: 12.0 * s.scale * s.units_per_ft / 12.0,
+        points: Vec::new(),
+        picked: Vec::new(),
+        circuit: None,
+    }));
+}
+
+fn wire_done(host: &mut dyn HostApi, body: &str) {
+    let mut parts = body.splitn(3, '|');
+    let ckt = dec(parts.next().unwrap_or("")).to_uppercase();
+    let handles: Vec<Handle> = parts
+        .next()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|h| u64::from_str_radix(h.trim(), 16).ok())
+        .map(Handle::new)
+        .collect();
+    let pts: Vec<(f64, f64)> = parts
+        .next()
+        .unwrap_or("")
+        .split(';')
+        .filter_map(|p| p.split_once(',').and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?))))
+        .collect();
+    if pts.len() < 2 || ckt.is_empty() {
+        return;
+    }
+    let upf = settings().lock().unwrap().units_per_ft;
+    host.begin_undo_group(&format!("Wire {ckt}"));
+    host.push_undo(&format!("Wire {ckt}"));
+    let h = host.add_entity(poly(&pts, false, WIRING_LAYER));
+    host.write_record(h, tag_record(&format!("{WIRE_PREFIX}{ckt}")));
+    // Notification devices on a NAC take the wired circuit name.
+    let mut moved = 0;
+    for dh in &handles {
+        if let Some(mut d) = host.read_record(*dh, APP).and_then(DeviceData::from_record) {
+            let is_nac = d.device_type().is_some_and(|t| t.category == Category::Notification);
+            if is_nac && d.circuit != ckt {
+                d.circuit = ckt.clone();
+                host.write_record(*dh, d.to_record());
+                moved += 1;
+            }
+        }
+    }
+    host.end_undo_group();
+    host.set_dirty();
+    let len_ft: f64 = pts.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum::<f64>() / upf;
+    host.push_output(&format!("{ckt}: wired {} devices, {:.0} ft drawn{}", handles.len(), len_ft,
+        if moved > 0 { format!(", {moved} moved onto {ckt}") } else { String::new() }));
+}
+
+// ───────────────────────────── riser ─────────────────────────────
+
+struct PickPointCmd {
+    prompt: &'static str,
+    command: &'static str,
+}
+
+impl InteractiveCommand for PickPointCmd {
+    fn prompt(&self) -> String {
+        self.prompt.to_string()
+    }
+    fn on_point(&mut self, pt: [f64; 3]) -> CommandStep {
+        CommandStep::Dispatch(format!("{}|{}|{}", self.command, pt[0], pt[1]))
+    }
+}
+
+fn riser_at(host: &mut dyn HostApi, x0: f64, y0: f64) {
+    if !ensure_setup(host) {
+        return;
+    }
+    let s = settings().lock().unwrap().clone();
+    let devs = collect_devices(host);
+    // circuit -> (device key, candela) -> count, SLC circuits first.
+    let mut circuits: BTreeMap<(u8, String), BTreeMap<(usize, u32), usize>> = BTreeMap::new();
+    let mut panels = 0;
+    for p in &devs {
+        let Some(dt) = p.data.device_type() else { continue };
+        if dt.category == Category::Panel && dt.key == "FACP" {
+            panels += 1;
+            continue;
+        }
+        let ckt = if p.data.circuit.is_empty() { "OTHER".to_string() } else { p.data.circuit.clone() };
+        let order = if ckt.starts_with("SLC") { 0 } else if ckt == "OTHER" { 2 } else { 1 };
+        let idx = DEVICES.iter().position(|d| d.key == dt.key).unwrap_or(0);
+        *circuits.entry((order, ckt)).or_default().entry((idx, p.data.candela)).or_default() += 1;
+    }
+    if circuits.is_empty() {
+        host.push_info("Fire Alarm: no devices to put on a riser yet.");
+        return;
+    }
+    let u = s.scale * s.units_per_ft / 12.0; // one symbol width = 12 * u
+    let th = 4.0 * u;
+    let dx = 30.0 * u;
+    let dy = 36.0 * u;
+    let mut ents: Vec<EntityType> = Vec::new();
+    // Panel
+    if let Some(facp) = catalog::by_key("FACP") {
+        let mut ins = build_insert(host, facp, Vector3::new(x0, y0, 0.0), s.scale, &[]);
+        ins.common.layer = RISER_LAYER.to_string();
+        ents.push(EntityType::Insert(ins));
+    }
+    ents.push(label("FIRE ALARM RISER DIAGRAM", x0 - 13.0 * u, y0 + 16.0 * u, th * 1.5, RISER_LAYER));
+    let bus_x = x0 + 13.0 * u;
+    let n = circuits.len();
+    let bottom = y0 - dy * n as f64;
+    ents.push(EntityType::Line(on_layer(Line::from_coords(bus_x, y0, 0.0, bus_x, bottom, 0.0), RISER_LAYER, |l, lay| l.common.layer = lay)));
+    for (row, ((_, ckt), items)) in circuits.iter().enumerate() {
+        let y = y0 - dy * (row as f64 + 1.0);
+        let end_x = bus_x + dx * (items.len() as f64 + 1.5);
+        ents.push(EntityType::Line(on_layer(Line::from_coords(bus_x, y, 0.0, end_x, y, 0.0), RISER_LAYER, |l, lay| l.common.layer = lay)));
+        let total: usize = items.values().sum();
+        ents.push(label(&format!("{ckt} ({total})"), bus_x + 2.0 * u, y + 2.0 * u, th, RISER_LAYER));
+        for (i, ((idx, cd), count)) in items.iter().enumerate() {
+            let dt = &DEVICES[*idx];
+            let cx = bus_x + dx * (i as f64 + 1.5);
+            let cy = y + 12.0 * u;
+            let attrs = [("CD", if dt.strobe { cd.to_string() } else { String::new() }), ("ADDR", String::new()), ("WW", String::new())];
+            let mut ins = build_insert(host, dt, Vector3::new(cx, cy, 0.0), s.scale, &attrs);
+            ins.common.layer = RISER_LAYER.to_string();
+            ins.attributes.iter_mut().for_each(|a| a.common.layer = RISER_LAYER.to_string());
+            ents.push(EntityType::Insert(ins));
+            ents.push(EntityType::Line(on_layer(Line::from_coords(cx, y, 0.0, cx, cy - 7.0 * u, 0.0), RISER_LAYER, |l, lay| l.common.layer = lay)));
+            ents.push(label(&format!("x{count}"), cx + 8.0 * u, cy - 4.0 * u, th, RISER_LAYER));
+        }
+    }
+    if panels == 0 {
+        ents.push(label("(panel not placed on plan)", x0 - 13.0 * u, y0 - 10.0 * u, th * 0.8, RISER_LAYER));
+    }
+    host.begin_undo_group("Fire alarm riser");
+    host.push_undo("Fire alarm riser");
+    host.add_entities(ents);
+    host.end_undo_group();
+    host.set_dirty();
+    host.push_output(&format!("Riser drawn: {n} circuits, {} devices. It is a snapshot; draw it again after changes.", devs.len()));
 }
 
 // ───────────────────────────── ribbon ─────────────────────────────
@@ -727,6 +1142,11 @@ impl CadModule for FireAlarmModule {
                 RibbonGroup { title: "Initiating", tools: device_tools(&[Category::Initiating]) },
                 RibbonGroup { title: "Notification", tools: device_tools(&[Category::Notification]) },
                 RibbonGroup { title: "Modules & Panels", tools: device_tools(&[Category::Module, Category::Panel, Category::Misc]) },
+                RibbonGroup { title: "Design", tools: vec![
+                    tool("FA_COVERAGE", "Coverage", "◎", "FA_COVERAGE", true),
+                    tool("FA_WIRE", "Wire Circuit", "∿", "FA_WIRE", true),
+                    tool("FA_RISER", "Riser", "≡", "FA_RISER", true),
+                ]},
                 RibbonGroup { title: "Reports & Calcs", tools: vec![
                     tool("FA_COUNT", "Device Count", "#", "FA_COUNT", true),
                     RibbonItem::LargeTool(ToolDef {
@@ -780,6 +1200,16 @@ impl BuiltinPlugin for FireAlarmPlugin {
             host.push_error("Fire Alarm: bad placement data");
             return true;
         }
+        if let Some(body) = trimmed.strip_prefix("FA_WIREDONE|").or_else(|| trimmed.strip_prefix("fa_wiredone|")) {
+            wire_done(host, body);
+            return true;
+        }
+        if let Some(rest) = upper.strip_prefix("FA_RISERAT|") {
+            if let Some((x, y)) = rest.split_once('|').and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?))) {
+                riser_at(host, x, y);
+            }
+            return true;
+        }
         if upper.starts_with("FA_DLG|") {
             let mut parts = trimmed.splitn(3, '|');
             let _ = parts.next();
@@ -809,6 +1239,12 @@ impl BuiltinPlugin for FireAlarmPlugin {
             "FA_COUNT" => { device_count(host); true }
             "FA_BATTERY" => { battery_calc(host); true }
             "FA_VDROP" => { vdrop_calc(host); true }
+            "FA_COVERAGE" => { coverage(host); true }
+            "FA_WIRE" => { start_wire(host); true }
+            "FA_RISER" => {
+                host.start_interactive(Box::new(PickPointCmd { prompt: "Pick the top-left point for the riser diagram", command: "FA_RISERAT" }));
+                true
+            }
             "FA_EXPORT" => {
                 host.push_info("Use the Export CSV button, or type FA_EXPORT followed by a file path.");
                 true
